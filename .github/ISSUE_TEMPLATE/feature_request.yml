@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest a new tool or an improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what makes it hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How it could work. Mention it if this is an item from ROADMAP.md.
+  - type: checkboxes
+    id: principles
+    attributes:
+      label: Fits the project
+      options:
+        - label: It keeps the SSH config as the single source of truth, asks before touching any server, and keeps secrets out of argv, files and history.

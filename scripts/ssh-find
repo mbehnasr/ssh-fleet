@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Find hosts by anything you remember about them.
+#
+#   ssh-find stg-k8s-cp-01          real hostname
+#   ssh-find 198.51.100.31          IP, or a prefix: 198.51.100.3
+#   ssh-find k8s worker             several words: all must match
+#   ssh-find osd                    notes are searched too
+#   ssh-find "not a node"           ... and status
+#
+#   -a   aliases only, one per line    ssh-tmux $(ssh-find -a k8s master)
+#   -1   exactly one match: print its alias, else fail and list candidates
+#   -c   connect: one match -> ssh in; several -> pick interactively
+#
+# Best match first. Exit status 0 if anything matched, 1 if nothing did.
+#
+# -a, -1 and -c act on what they return, so they only use matches on the
+# alias, IP or hostname -- a note mentioning "workers" does not make a VIP a
+# worker. Notes and status are used only when nothing else matches, which
+# keeps  ssh-find -a "not a node"  working. The table shows every match.
+# -----------------------------------------------------------------------------
+set -uo pipefail
+SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
+HERE="$(dirname "$(readlink -f "$0")")"
+LIB="$HERE/lib"
+usage() { sed -n '3,17p' "$0" | sed 's/^# \?//'; }
+
+MODE=table; declare -a TERMS=()
+for arg in "$@"; do
+    case "$arg" in
+        -a) MODE=aliases ;;
+        -1) MODE=one ;;
+        -c) MODE=connect ;;
+        -h|--help) usage; exit 0 ;;
+        -?*) echo "unknown option: $arg" >&2; exit 2 ;;
+        *) TERMS+=("$arg") ;;
+    esac
+done
+[ "${#TERMS[@]}" -eq 0 ] && { usage >&2; exit 2; }
+Q="${TERMS[*]}"
+
+search() {  # search <strict 0|1>
+    awk -f "$LIB/fleet-index.awk" "$SSH_DIR"/config.d/*.conf 2>/dev/null |
+    awk -v q="$Q" -v strict="$1" -f "$LIB/fleet-search.awk" |
+    sort -t$'\t' -k1,1nr -k2,2 | cut -f2-
+}
+if [ "$MODE" = table ]; then
+    mapfile -t ROWS < <(search 0)
+else
+    mapfile -t ROWS < <(search 1)
+    [ "${#ROWS[@]}" -eq 0 ] && mapfile -t ROWS < <(search 0)
+fi
+n=${#ROWS[@]}
+[ "$n" -eq 0 ] && { echo "no host matches: $Q" >&2; exit 1; }
+
+table() {
+    { printf 'ALIAS\tIP\tHOSTNAME\tSTATUS\n'
+      local r a ip hn st
+      for r in "$@"; do
+          IFS=$'\t' read -r a _ _ _ ip hn st _ <<<"$r"
+          printf '%s\t%s\t%s\t%s\n' "$a" "$ip" "$hn" "${st%% (*}"
+      done
+    } | column -t -s$'\t'
+}
+
+case "$MODE" in
+    table)   table "${ROWS[@]}" ;;
+    aliases) printf '%s\n' "${ROWS[@]%%$'\t'*}" ;;
+    one)     if [ "$n" -eq 1 ]; then printf '%s\n' "${ROWS[0]%%$'\t'*}"
+             else echo "$n hosts match '$Q' -- be more specific:" >&2; table "${ROWS[@]}" >&2; exit 1; fi ;;
+    connect) if [ "$n" -eq 1 ]; then exec ssh "${ROWS[0]%%$'\t'*}"
+             else exec "$HERE/ssh-menu" -s "$Q"; fi ;;
+esac

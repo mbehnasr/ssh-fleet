@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Key material must NEVER enter this repository. Private keys live only in
+# ~/.ssh/keys, mode 600, and are backed up out-of-band (offline, encrypted).
+# ---------------------------------------------------------------------------
+keys/
+*.pem
+*.key
+*_ed25519
+*_ed25519_sk
+*_rsa
+*_ecdsa
+id_*
+*.pub
+
+# Host-key databases are machine state, not configuration.
+known_hosts*
+
+# Untracked local overrides: personal exceptions, one-off hosts, credentials
+# for a host you have not onboarded yet. Read first, so it wins over the
+# tracked environment files.
+config.d/00-local.conf
+
+# Backups produced by scripts/install.sh
+backup-*/
+
+# Automatic backups written by scripts/ssh-manage before every edit
+config.d/*.bak-*
+config.d/*.removed-*
+
+# Site-specific terms for tests/check-no-private-data.sh. Listing your internal
+# names is itself sensitive, so the list never leaves your machine.
+.private-terms
+
+# Python bytecode from ssh-pass
+__pycache__/

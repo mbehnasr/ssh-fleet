@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Print every alias with the settings ssh will actually use.
+#
+#   scripts/ssh-hosts             all environments
+#   scripts/ssh-hosts staging     one environment (prefix match)
+#
+# Everything shown comes from "ssh -G", i.e. the effective, fully resolved
+# configuration -- not from grepping the files.
+# -----------------------------------------------------------------------------
+set -uo pipefail
+SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
+FILTER="${1:-}"
+
+# Real node names from "# hostname:" comments (see lib/fleet-index.awk).
+declare -A NODE=()
+IDX_AWK="$(dirname "$(readlink -f "$0")")/lib/fleet-index.awk"
+if [ -r "$IDX_AWK" ]; then
+    while IFS=$'\t' read -r a _ _ _ _ hn _ _; do NODE[$a]="$hn"; done \
+        < <(awk -f "$IDX_AWK" "$SSH_DIR"/config.d/*.conf 2>/dev/null)
+fi
+
+{
+printf 'ALIAS\tLOGIN\tNODE\tPORT\tKEY\tAUTH\tVIA\n'
+grep -h '^Host ' "$SSH_DIR"/config.d/*.conf 2>/dev/null |
+  sed 's/^Host //' | tr ' ' '\n' | grep -v '[*?]' | grep -v '^$' | sort -u |
+while read -r a; do
+    [ -n "$FILTER" ] && case "$a" in "$FILTER"*) ;; *) continue ;; esac
+    cfg=$(ssh -F "$SSH_DIR/config" -G "$a" 2>/dev/null) || continue
+    g() { awk -v k="$1" '$1==k {print $2; exit}' <<<"$cfg"; }
+    key=$(basename "$(g identityfile)" 2>/dev/null)
+    jump=$(g proxyjump); [ -z "$jump" ] && jump='-'
+    case "$(g pubkeyauthentication)" in yes|true) auth=key ;; *) auth=PASSWORD; key='-' ;; esac
+    printf '%s\t%s@%s\t%s\t%s\t%s\t%s\t%s\n' "$a" "$(g user)" "$(g hostname)" "${NODE[$a]:--}" "$(g port)" "$key" "$auth" "$jump"
+done
+} | column -t -s$'\t'

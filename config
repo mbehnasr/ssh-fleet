@@ -1,0 +1,132 @@
+# =============================================================================
+#  ~/.ssh/config
+#
+#  Managed from:  <this repository>/config   (see scripts/install.sh)
+#  Do NOT edit ~/.ssh/config directly -- it is a symlink to the repo.
+#
+#  HOW OPENSSH READS THIS FILE  (the single most important thing to know)
+#  ---------------------------------------------------------------------
+#  ssh(1) uses FIRST-OBTAINED-WINS resolution: the first time a keyword is
+#  seen for a given target, its value is locked in permanently. Later blocks
+#  can add new keywords but can never override one already set.
+#
+#  Therefore this file is ordered MOST SPECIFIC -> LEAST SPECIFIC:
+#
+#      1. Include config.d/*.conf   per-host blocks, then per-env defaults
+#      2. Host *                    workstation-wide defaults (this file)
+#      3. /etc/ssh/ssh_config       system defaults (read last, lowest prio)
+#
+#  Anything set in an environment file therefore beats the "Host *" block
+#  below, and both beat the system config. That is what lets a single host
+#  override the global user, key, or auth method with one extra line.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. ENVIRONMENT DEFINITIONS
+# -----------------------------------------------------------------------------
+# Include globs are expanded alphabetically, so the read order is:
+#     00-local.conf   -> untracked personal overrides (highest precedence)
+#     forges.conf     -> github.com and other code forges
+#     lab.conf
+#     production.conf
+#     staging.conf    -> ... one file per environment
+# Environments use disjoint alias prefixes (staging_*, lab_*, ...), so their
+# relative order is irrelevant -- a new environment is just a new file here.
+# Relative paths in Include are resolved against ~/.ssh, the absolute form is
+# used for clarity.
+Include ~/.ssh/config.d/*.conf
+
+
+# -----------------------------------------------------------------------------
+# 2. WORKSTATION-WIDE DEFAULTS
+# -----------------------------------------------------------------------------
+# Everything below is a *fallback*. Any host or environment block above may
+# override any of it. Keep this block free of anything host-specific.
+Host *
+
+    # -- Identity -------------------------------------------------------------
+    # The account used on virtually every server in the fleet. Defined once,
+    # globally; per-host exceptions (git@, root@, vendor appliances) simply put
+    # their own "User" line in their own block, which is read first and wins.
+    # Left unset, ssh uses your local login name. Uncomment and set it once:
+    #User your-account
+
+    # Only offer keys that a config file explicitly names (plus the built-in
+    # default identities). Without this, ssh offers EVERY key in the agent to
+    # every server: it leaks which keys you hold to any host you touch and it
+    # trips sshd's MaxAuthTries (default 6) once you carry a handful of keys,
+    # producing the classic "Too many authentication failures" lockout.
+    IdentitiesOnly yes
+
+    # Load a key into the running agent the first time it is used, so the
+    # passphrase is typed once per session rather than once per connection.
+    # NOTE: 'confirm'/'ask' need an SSH_ASKPASS binary, which is not installed
+    # on this machine -- do not enable them without installing ssh-askpass-gnome.
+    AddKeysToAgent yes
+
+    # -- Host key verification ------------------------------------------------
+    # 'ask' = trust-on-first-use with a prompt, and a hard failure if a known
+    # key ever changes. Never set this to 'no' or 'accept-new' fleet-wide: it
+    # silently accepts machine-in-the-middle on first contact, which is exactly
+    # when you are most exposed. Pre-seed known_hosts instead (see README).
+    StrictHostKeyChecking ask
+
+    # Store host names/addresses hashed, so a stolen known_hosts file does not
+    # hand an attacker a map of the internal network.
+    HashKnownHosts yes
+
+    # Learn additional host keys offered by the server after authentication,
+    # so server-side host key rotation does not lock you out.
+    UpdateHostKeys yes
+
+    # -- Never hand credentials or a display to a remote host -----------------
+    # Agent forwarding lets root on the remote host use your keys for as long
+    # as you are logged in. Use ProxyJump instead: it keeps every private key
+    # and every signing operation on this workstation. Enable ForwardAgent
+    # only per-host, only when unavoidable, and prefer 'ssh-add -c' if so.
+    ForwardAgent no
+    ForwardX11 no
+    ForwardX11Trusted no
+    PermitLocalCommand no
+
+    # -- Authentication methods actually in use -------------------------------
+    # Ubuntu's /etc/ssh/ssh_config enables GSSAPI (Kerberos) globally. With no
+    # KDC -- the normal case in an air-gapped fleet -- it only adds a failing
+    # lookup and latency to every connection. Turned off here; a site that does
+    # run Kerberos can re-enable it in one environment file.
+    GSSAPIAuthentication no
+
+    # -- Connection behaviour -------------------------------------------------
+    # Fail fast on an unreachable host instead of hanging for ~2 minutes.
+    ConnectTimeout 10
+
+    # Application-level keepalives over the encrypted channel: detects dead
+    # peers and keeps idle sessions alive through firewall/NAT idle timers.
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+
+    # TCP-level keepalives are unencrypted, spoofable, and drop sessions on
+    # brief network blips. ServerAlive* above is the better mechanism.
+    TCPKeepAlive no
+
+    # -- Connection multiplexing ----------------------------------------------
+    # Reuse one authenticated TCP connection for every further session to the
+    # same host: subsequent ssh/scp/rsync/ansible calls start in milliseconds
+    # with no re-authentication. %C is a hash of local host + host + port +
+    # user + jump host, which keeps the socket path short (UNIX sockets are
+    # capped near 104 bytes) and unambiguous.
+    # The socket lives in ~/.ssh/cm (mode 700). Anyone who can write to that
+    # directory can ride your open sessions, so never place it in /tmp.
+    ControlMaster auto
+    ControlPath ~/.ssh/cm/%C
+    ControlPersist 10m
+
+    # -- Misc -----------------------------------------------------------------
+    # Compression costs CPU and wins nothing on a LAN; enable per-host for
+    # slow or high-latency links only.
+    Compression no
+
+    # Uncomment on an IPv4-only fleet to skip the AAAA lookup and the IPv6
+    # connect attempt on every connection.
+    #AddressFamily inet

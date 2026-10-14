@@ -1,0 +1,22 @@
+# =============================================================================
+#  ~/.ssh/config.d/00-local.conf   -- personal, untracked, read FIRST
+#
+#  Copy to 00-local.conf (gitignored). Because the Include glob is alphabetical
+#  and OpenSSH is first-match-wins, anything here overrides every tracked
+#  environment file without editing them -- ideal for a temporary exception you
+#  do not want to commit or a host that is not onboarded yet.
+#
+#  Still no passwords. Ever.
+# =============================================================================
+
+# Temporarily reach a rebuilt host at a new address without touching git:
+#Host staging_ceph_node3
+#    HostName 198.51.100.153
+
+# A one-off vendor appliance that is not part of any environment:
+#Host vendor_storage_console
+#    HostName 192.0.2.240
+#    User admin
+#    PubkeyAuthentication no
+#    PreferredAuthentications keyboard-interactive,password
+#    HostKeyAlgorithms +ssh-rsa

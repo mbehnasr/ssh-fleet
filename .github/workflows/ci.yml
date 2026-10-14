@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and privacy check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -S warning -x scripts/*.sh scripts/ssh-askpass scripts/ssh-find \
+            scripts/ssh-hosts scripts/ssh-manage scripts/ssh-menu scripts/ssh-tmux tests/*.sh
+
+      - name: ssh-pass parses
+        run: python3 -c "import ast; ast.parse(open('scripts/ssh-pass').read())"
+
+      - name: No private infrastructure data
+        run: tests/check-no-private-data.sh
+
+  test:
+    name: Smoke and end-to-end tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-client bsdextrautils
+          ssh -V
+
+      - name: Smoke test (throwaway SSH_DIR)
+        run: tests/smoke.sh
+
+      # The runner is disposable, so the real install into ~/.ssh is safe here.
+      - name: End-to-end test (installs into ~/.ssh)
+        run: SSH_FLEET_E2E=1 tests/e2e.sh

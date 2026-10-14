@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Saved SSH passwords, MobaXterm-style, backed by the GNOME login keyring.
+
+    ssh-pass set <alias|user@host>   store a password (prompted, never echoed)
+    ssh-pass set --env <env>         one password for a whole environment
+    ssh-pass set --default           one password for everything
+    ssh-pass get <alias|user@host>   show which entry would be used
+    ssh-pass list                    list stored entries (never the secrets)
+    ssh-pass rm  <alias|user@host|--env <env>|--default>
+    ssh-pass askpass "<prompt>"      SSH_ASKPASS backend (see ssh-askpass)
+
+Secrets live in the login keyring via libsecret -- encrypted at rest, unlocked
+with your session, never written to a file in this repo or to shell history.
+
+Lookup order, most specific first:
+    1. exact   user@host
+    2. env     the environment that host belongs to (from ~/.ssh/config.d)
+    3. default one password for the whole fleet
+
+A password saved for the whole fleet is exactly as powerful as the account it
+belongs to: anyone at your unlocked session can use it everywhere. Deploying
+keys (scripts/deploy-key.sh) removes the need for it entirely.
+"""
+import os, re, sys, getpass
+
+import gi
+gi.require_version("Secret", "1")
+from gi.repository import Secret
+
+SCHEMA = Secret.Schema.new(
+    "org.workstation.sshconfig",
+    Secret.SchemaFlags.NONE,
+    {"kind": Secret.SchemaAttributeType.STRING,
+     "target": Secret.SchemaAttributeType.STRING},
+)
+CONF_D = os.path.expanduser(os.environ.get("SSH_DIR", "~/.ssh") + "/config.d")
+
+
+def host_env_map():
+    """hostname -> environment, derived from which config.d file defines it."""
+    m = {}
+    if not os.path.isdir(CONF_D):
+        return m
+    for fn in sorted(os.listdir(CONF_D)):
+        if not fn.endswith(".conf"):
+            continue
+        env = fn[:-5]
+        try:
+            text = open(os.path.join(CONF_D, fn), encoding="utf8", errors="replace").read()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            s = line.strip()
+            if s.lower().startswith("hostname"):
+                parts = s.split()
+                if len(parts) > 1:
+                    m.setdefault(parts[1], env)
+    return m
+
+
+def resolve(target):
+    """Accept an ssh alias or a literal user@host; return (user, host, env)."""
+    if "@" in target:
+        user, host = target.split("@", 1)
+    else:
+        import subprocess
+        try:
+            out = subprocess.run(["ssh", "-G", target], capture_output=True,
+                                 text=True, timeout=10).stdout
+        except Exception:
+            out = ""
+        user = host = None
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) > 1 and f[0] == "user":
+                user = f[1]
+            elif len(f) > 1 and f[0] == "hostname":
+                host = f[1]
+        if not host or host == target:
+            sys.exit("cannot resolve '%s' to a host" % target)
+    return user, host, host_env_map().get(host)
+
+
+def store(kind, target, password, label):
+    Secret.password_store_sync(SCHEMA, {"kind": kind, "target": target},
+                               Secret.COLLECTION_DEFAULT, label, password, None)
+
+
+def lookup(kind, target):
+    return Secret.password_lookup_sync(SCHEMA, {"kind": kind, "target": target}, None)
+
+
+def clear(kind, target):
+    return Secret.password_clear_sync(SCHEMA, {"kind": kind, "target": target}, None)
+
+
+def find(user, host, env):
+    """Most specific match wins. Returns (secret, which_entry)."""
+    for kind, target in (("password", "%s@%s" % (user, host)),
+                         ("env-password", env or "\x00"),
+                         ("password", "*")):
+        if target == "\x00":
+            continue
+        s = lookup(kind, target)
+        if s is not None:
+            return s, "%s:%s" % (kind, target)
+    return None, None
+
+
+def _tty():
+    """Open the terminal as two one-way streams.
+
+    open("/dev/tty", "r+") looks obvious and is wrong: Python's buffered
+    read-write wrapper requires a seekable file, and a tty is not seekable, so
+    it raises io.UnsupportedOperation. That exception subclasses OSError, so a
+    plain `except OSError` swallows it and you silently get no prompt at all --
+    which ssh then reads as an empty answer, i.e. "no".
+    """
+    return open("/dev/tty", "r"), open("/dev/tty", "w")
+
+
+def ask_tty(prompt, echo=False):
+    """Prompt on the terminal. Never on stdout: ssh reads stdout as the answer."""
+    try:
+        tin, tout = _tty()
+    except OSError:
+        return None
+    try:
+        tout.write(prompt)
+        tout.flush()
+        if echo:
+            line = tin.readline()
+        else:
+            import termios
+            fd = tin.fileno()
+            old = termios.tcgetattr(fd)
+            new = list(old)
+            new[3] &= ~termios.ECHO
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, new)
+                line = tin.readline()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            tout.write("\n")
+            tout.flush()
+        if line == "":          # EOF, not an answer
+            return None
+        return line.rstrip("\n")
+    except Exception:
+        return None
+    finally:
+        try:
+            tin.close(); tout.close()
+        except Exception:
+            pass
+
+
+def confirm_tty(prompt):
+    ans = ask_tty(prompt, echo=True)
+    return (ans or "").strip().lower() in ("y", "yes")
+
+
+# --------------------------------------------------------------- askpass ---
+RE_PASSPHRASE = re.compile(r"passphrase for key ['\"]?([^'\"]+)['\"]?", re.I)
+RE_PW1 = re.compile(r"([^\s@]+)@([^\s']+)'s password", re.I)
+RE_PW2 = re.compile(r"\(([^)@]+)@([^)]+)\)\s*password", re.I)
+
+
+def cmd_askpass(prompt):
+    # Host-key confirmation must NEVER be auto-answered: that is the check that
+    # detects a machine-in-the-middle. Hand it straight to the human.
+    if "continue connecting" in prompt.lower() or "fingerprint" in prompt.lower():
+        # Echo the answer: it is not a secret, and you need to see what you type.
+        ans = ask_tty(prompt, echo=True)
+        if ans is None:
+            # No terminal to ask on. Return failure rather than an empty string:
+            # an empty answer means "no" to ssh, which would look like a host
+            # key rejection instead of "the helper could not reach you".
+            sys.stderr.write("ssh-pass: no terminal available to confirm the "
+                             "host key; answer it manually or unset "
+                             "SSH_ASKPASS_REQUIRE\n")
+            return 1
+        print(ans.strip())
+        return 0
+
+    m = RE_PASSPHRASE.search(prompt)
+    if m:
+        keyfile = os.path.realpath(os.path.expanduser(m.group(1)))
+        s = lookup("passphrase", keyfile)
+        if s is not None:
+            print(s)
+            return 0
+        s = ask_tty(prompt)
+        if s is None:
+            return 1
+        print(s)
+        if confirm_tty("  save this passphrase in the login keyring? [y/N]: "):
+            store("passphrase", keyfile, s, "SSH key passphrase for %s" % keyfile)
+        return 0
+
+    m = RE_PW1.search(prompt) or RE_PW2.search(prompt)
+    if m:
+        user, host = m.group(1), m.group(2)
+        env = host_env_map().get(host)
+        s, which = find(user, host, env)
+        if s is not None:
+            return (print(s), 0)[1]
+        s = ask_tty(prompt)
+        if s is None:
+            return 1
+        print(s)
+        if confirm_tty("  save password for %s@%s in the login keyring? [y/N]: " % (user, host)):
+            store("password", "%s@%s" % (user, host), s,
+                  "SSH password for %s@%s" % (user, host))
+        return 0
+
+    # Unrecognised prompt: never guess, just relay it.
+    s = ask_tty(prompt)
+    if s is None:
+        return 1
+    print(s)
+    return 0
+
+
+# ------------------------------------------------------------------ CLI ---
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd == "askpass":
+        return cmd_askpass(rest[0] if rest else "Password: ")
+
+    if cmd == "set":
+        if rest and rest[0] == "--default":
+            pw = getpass.getpass("password for the whole fleet: ")
+            if not pw:
+                return 1
+            store("password", "*", pw, "SSH password (fleet default)")
+            print("stored: fleet default")
+        elif rest and rest[0] == "--env":
+            if len(rest) < 2:
+                return 2
+            pw = getpass.getpass("password for environment '%s': " % rest[1])
+            if not pw:
+                return 1
+            store("env-password", rest[1], pw, "SSH password for environment %s" % rest[1])
+            print("stored: environment %s" % rest[1])
+        elif rest:
+            user, host, env = resolve(rest[0])
+            pw = getpass.getpass("password for %s@%s: " % (user, host))
+            if not pw:
+                return 1
+            store("password", "%s@%s" % (user, host), pw,
+                  "SSH password for %s@%s" % (user, host))
+            print("stored: %s@%s" % (user, host))
+        else:
+            return 2
+        return 0
+
+    if cmd == "get":
+        if not rest:
+            return 2
+        user, host, env = resolve(rest[0])
+        s, which = find(user, host, env)
+        print("%s@%s (env %s) -> %s" % (user, host, env, which or "NO ENTRY"))
+        return 0 if s else 1
+
+    if cmd == "rm":
+        if rest and rest[0] == "--default":
+            ok = clear("password", "*")
+        elif rest and rest[0] == "--env" and len(rest) > 1:
+            ok = clear("env-password", rest[1])
+        elif rest:
+            user, host, _ = resolve(rest[0])
+            ok = clear("password", "%s@%s" % (user, host))
+        else:
+            return 2
+        print("removed" if ok else "no such entry")
+        return 0 if ok else 1
+
+    if cmd == "list":
+        n = 0
+        for kind in ("password", "env-password", "passphrase"):
+            try:
+                items = Secret.password_search_sync(
+                    SCHEMA, {"kind": kind},
+                    Secret.SearchFlags.ALL | Secret.SearchFlags.UNLOCK, None)
+            except Exception:
+                items = []
+            for it in items:
+                a = it.get_attributes()
+                print("  %-14s %s" % (a.get("kind", kind), a.get("target", "?")))
+                n += 1
+        if n == 0:
+            print("  (nothing stored)")
+        return 0
+
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

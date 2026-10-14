@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Open one tmux pane per host, with input synchronised across all of them, so
+# a command typed once runs everywhere.
+#
+#   ssh-tmux staging_k8s_master1 staging_k8s_master2
+#   ssh-tmux --group staging k8s           every host in a purpose group
+#   ssh-tmux --group lab                   every host in an environment
+#   ssh-tmux --pattern 'staging_k8s_worker*'  glob over aliases
+#   ssh-tmux $(ssh-find -a lab worker)     anything ssh-find selects
+#   ssh-menu: space to mark, t to launch
+#
+#   --no-sync     start with synchronisation off
+#   --window      open in a NEW terminal window instead of this one
+#   --no-attach   build the session and leave it detached (scripting)
+#   --force       open even if the panes would be too small to use
+#
+# Synchronisation is per tmux WINDOW, so all hosts share one window. Toggle it
+# live with:   C-b :setw synchronize-panes      (status bar shows SYNC ON/off)
+# Exit every host normally and the session closes itself; a pane whose
+# connection FAILED stays open so the error can be read.
+# -----------------------------------------------------------------------------
+set -uo pipefail
+
+SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
+CONF_D="$SSH_DIR/config.d"
+SYNC=on; NEWWIN=0; FORCE=0; ATTACH=1
+MIN_ROWS=6; MIN_COLS=40          # smallest pane still usable as a shell
+declare -a HOSTS=()
+
+aliases_all() {
+    grep -h '^[[:space:]]*Host[[:space:]]' "$CONF_D"/*.conf 2>/dev/null |
+    sed 's/^[[:space:]]*Host[[:space:]]*//' | tr ' ' '\n' |
+    grep -v '[*?]' | grep -v '^$' | grep -v '\.' | sort -u
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-sync)   SYNC=off; shift ;;
+        --no-attach) ATTACH=0; shift ;;
+        --window|-w) NEWWIN=1; shift ;;
+        --force)     FORCE=1; shift ;;
+        --group|-g)
+            env="${2:-}"
+            [ -z "$env" ] || [ "${env#-}" != "$env" ] && { echo "usage: ssh-tmux --group <env> [purpose]" >&2; exit 2; }
+            purpose="${3:-}"
+            if [ -n "$purpose" ] && [ "${purpose#-}" = "$purpose" ]; then pat="^${env}_${purpose}_"; shift 3
+            else pat="^${env}_"; shift 2; fi
+            mapfile -t found < <(aliases_all | grep -E "$pat")
+            HOSTS+=("${found[@]}") ;;
+        --pattern|-p)
+            [ -z "${2:-}" ] && { echo "usage: ssh-tmux --pattern <glob>" >&2; exit 2; }
+            mapfile -t found < <(aliases_all | grep -E "^$(sed 's/[.]/\\./g; s/[*]/.*/g; s/[?]/./g' <<<"$2")$")
+            HOSTS+=("${found[@]}"); shift 2 ;;
+        -h|--help) sed -n '3,22p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -) mapfile -t found; HOSTS+=("${found[@]}"); shift ;;
+        -*) echo "unknown option: $1" >&2; exit 2 ;;
+        *) HOSTS+=("$1"); shift ;;
+    esac
+done
+[ "${#HOSTS[@]}" -eq 0 ] && { echo "no hosts given (try --help)" >&2; exit 2; }
+
+declare -a UNIQ=(); declare -A seen=()
+for h in "${HOSTS[@]}"; do [ -n "${seen[$h]:-}" ] && continue; seen[$h]=1; UNIQ+=("$h"); done
+HOSTS=("${UNIQ[@]}")
+
+# every alias must resolve, or tmux opens panes that instantly die
+for h in "${HOSTS[@]}"; do
+    hn=$(ssh -G "$h" 2>/dev/null | awk '$1=="hostname"{print $2; exit}')
+    { [ -z "$hn" ] || [ "$hn" = "$h" ]; } && { echo "alias does not resolve: $h" >&2; exit 1; }
+done
+n=${#HOSTS[@]}
+command -v tmux >/dev/null || { echo "tmux is not installed" >&2; exit 1; }
+
+# --- which terminal will show it ---------------------------------------------
+# tmux refuses a terminal reached through the /dev/tty alias ("open terminal
+# failed: can't use /dev/tty"), which is what stdin is whenever a caller
+# redirected it from /dev/tty. Resolve the real device (/dev/pts/N) first, and
+# do it BEFORE building anything, so a failure can never leave a session running
+# that nobody can see.
+real_tty() {
+    local t
+    t=$(tty 2>/dev/null)
+    case "$t" in /dev/tty|"not a tty"|"") ;; *) printf '%s' "$t"; return 0 ;; esac
+    t=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
+    case "$t" in ''|'?') return 1 ;; esac
+    [ -c "/dev/$t" ] || return 1
+    printf '/dev/%s' "$t"
+}
+TTY=""
+if [ "$ATTACH" -eq 1 ] && [ -z "${TMUX:-}" ]; then
+    if ! TTY=$(real_tty); then
+        [ "$NEWWIN" -eq 1 ] || { echo "no terminal to attach to; use --window or --no-attach" >&2; exit 1; }
+        TTY=""
+    fi
+fi
+
+# --- is there room? ------------------------------------------------------------
+# Judge the size each pane would really get under tmux's tiled layout rather
+# than capping the count: 13 panes are fine maximised and useless on 80x24.
+size=""
+if [ -n "${TMUX:-}" ]; then size=$(tmux display-message -p '#{client_height} #{client_width}' 2>/dev/null)
+elif [ -n "$TTY" ] && [ "$NEWWIN" -eq 0 ]; then size=$(stty size <"$TTY" 2>/dev/null); fi
+if [ "$FORCE" -eq 0 ] && [ "$n" -gt 1 ]; then
+    if [ -n "$size" ]; then
+        read -r trows tcols <<<"$size"
+        gr=1; gc=1                                      # tmux layout_set_tiled
+        while [ $((gr * gc)) -lt "$n" ]; do
+            gr=$((gr + 1)); [ $((gr * gc)) -lt "$n" ] && gc=$((gc + 1))
+        done
+        ph=$(( (trows - 1) / gr - 1 )); pw=$(( tcols / gc - 1 ))
+        if [ "$ph" -lt "$MIN_ROWS" ] || [ "$pw" -lt "$MIN_COLS" ]; then
+            printf '%d panes on this %dx%d terminal would be about %d rows by %d columns each.\n' \
+                   "$n" "$trows" "$tcols" "$ph" "$pw" >&2
+            printf 'That needs a terminal of at least %dx%d: enlarge it, narrow the selection, or use --force.\n' \
+                   $(( gr * (MIN_ROWS + 1) + 1 )) $(( gc * (MIN_COLS + 1) )) >&2
+            exit 1
+        fi
+    elif [ "$n" -gt 12 ]; then
+        echo "$n panes, and the size of the new window is unknown; use --force if it will be large." >&2
+        exit 1
+    fi
+fi
+
+SESSION="fleet-$(date +%H%M%S)-$$"
+
+build() {
+    local first p i geo=()
+    [ -n "$size" ] && { read -r trows tcols <<<"$size"; geo=(-x "$tcols" -y "$trows"); }
+    # Pane ids, not numeric indexes: a user's base-index/pane-base-index setting
+    # would otherwise make "session:0.1" point at nothing.
+    first=$(tmux new-session -d -P -F '#{pane_id}' -s "$SESSION" -n multi "${geo[@]}" "ssh ${HOSTS[0]}") || return 1
+    # "failed" keeps only panes whose connection failed, so the error can be
+    # read; exiting every host normally ends the session instead of leaving it
+    # behind. Older tmux lacks "failed" and falls back to "on".
+    tmux set-option -t "$SESSION" -w remain-on-exit failed 2>/dev/null ||
+        tmux set-option -t "$SESSION" -w remain-on-exit on
+    tmux select-pane -t "$first" -T "${HOSTS[0]}"
+    for ((i = 1; i < n; i++)); do
+        p=$(tmux split-window -P -F '#{pane_id}' -t "$SESSION:multi" "ssh ${HOSTS[$i]}") || return 1
+        tmux select-layout -t "$SESSION:multi" tiled >/dev/null
+        tmux select-pane -t "$p" -T "${HOSTS[$i]}"
+    done
+    tmux select-layout -t "$SESSION:multi" tiled >/dev/null
+    tmux set-option -t "$SESSION" -w pane-border-status top
+    tmux set-option -t "$SESSION" -w pane-border-format ' #{pane_index} #{pane_title} '
+    tmux set-option -t "$SESSION" -w synchronize-panes "$SYNC"
+    tmux set-option -t "$SESSION" status-right \
+        '#[bold]#{?pane_synchronized,#[bg=red#,fg=white] SYNC ON ,#[bg=green#,fg=black] sync off } #[default] C-b :setw synchronize-panes '
+    tmux set-option -t "$SESSION" status-left "[$SESSION] "
+    tmux set-option -t "$SESSION" status-left-length 40
+    tmux set-option -t "$SESSION" status-right-length 80
+    tmux select-pane -t "$first"
+}
+
+if ! build; then
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    echo "could not build the tmux session" >&2
+    exit 1
+fi
+printf 'session %s: %d panes, sync %s\n' "$SESSION" "$n" "$SYNC" >&2
+
+if [ "$ATTACH" -eq 0 ]; then
+    printf 'left detached; attach with:  tmux attach -t %s\n' "$SESSION" >&2
+    exit 0
+fi
+
+if [ "$NEWWIN" -eq 1 ] && [ -z "${TMUX:-}" ]; then
+    for term in gnome-terminal xdg-terminal-exec kitty alacritty konsole xterm; do
+        command -v "$term" >/dev/null || continue
+        case "$term" in
+            gnome-terminal)    setsid "$term" -- tmux attach -t "$SESSION" >/dev/null 2>&1 & ;;
+            xdg-terminal-exec) setsid "$term" tmux attach -t "$SESSION" >/dev/null 2>&1 & ;;
+            *)                 setsid "$term" -e tmux attach -t "$SESSION" >/dev/null 2>&1 & ;;
+        esac
+        echo "opened in a new $term window" >&2
+        exit 0
+    done
+    [ -n "$TTY" ] || { tmux kill-session -t "$SESSION"; echo "no terminal emulator and no terminal here; session removed" >&2; exit 1; }
+    echo "no terminal emulator found; attaching here instead" >&2
+fi
+
+if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "$SESSION"                  # nesting an attach is not allowed
+elif ! tmux attach-session -t "$SESSION" <"$TTY"; then
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    echo "could not attach; session $SESSION removed rather than left running unseen" >&2
+    exit 1
+fi

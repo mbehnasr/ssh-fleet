@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Interactive host picker:  environment -> purpose -> server -> connect
+#
+#   ssh-menu                 browse (arrow keys, PgUp/PgDn, or type the number)
+#   ssh-menu -s [text]       search by alias, IP, hostname, role, notes, status
+#   ssh-menu /text           same thing
+#   ssh-menu --tree          print the whole fleet as a tree and exit
+#   ssh-menu staging         one environment, ignoring the saved context
+#   ssh-menu staging k8s     straight to one purpose group
+#   ssh-menu --env <name>    set the sticky environment context
+#   ssh-menu --env-clear     forget it (menu asks again next run)
+#
+# Press / on any screen to search. The environment is remembered between runs,
+# so the usual path is purpose -> server; press e to switch environment.
+# The ten most recently used hosts head the first screen.
+# A yellow ! marks a host whose metadata carries a status (e.g. not a node of
+# the live cluster).
+# -----------------------------------------------------------------------------
+set -uo pipefail
+
+SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
+CONF_D="$SSH_DIR/config.d"
+HERE="$(dirname "$(readlink -f "$0")")"
+LIB="$HERE/lib"
+STATE="${SSH_MENU_STATE:-$SSH_DIR/.ssh-menu}"
+HIST="$STATE/history"
+ENVFILE="$STATE/env"
+mkdir -p "$STATE" 2>/dev/null; chmod 700 "$STATE" 2>/dev/null
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    B=$'\033[1m'; DIM=$'\033[2m'; C1=$'\033[36m'; C2=$'\033[33m'; C3=$'\033[32m'
+    REV=$'\033[7m'; N=$'\033[0m'
+else B=''; DIM=''; C1=''; C2=''; C3=''; REV=''; N=''; fi
+
+# --- terminal hygiene --------------------------------------------------------
+# Interactive screens hide the cursor and disable line wrapping: a row that
+# wrapped would occupy two lines and break the in-place redraw, so long rows
+# are clipped at the terminal edge instead. Both are always given back,
+# including on Ctrl-C.
+tty_restore() { printf '\033[?25h\033[?7h' >&2; }
+trap 'tty_restore; printf "\n" >&2; exit 130' INT TERM
+term_rows() { local r; r=$(stty size </dev/tty 2>/dev/null) && echo "${r%% *}" || echo 40; }
+
+# --- index -------------------------------------------------------------------
+# Columns: alias env purpose server ip hostname status notes (lib/fleet-index.awk)
+# Missing metadata is "-", never an empty field.
+[ -r "$LIB/fleet-index.awk" ] || { echo "missing $LIB/fleet-index.awk" >&2; exit 1; }
+build_index() {
+    awk -f "$LIB/fleet-index.awk" "$CONF_D"/*.conf 2>/dev/null |
+    sort -t$'\t' -k2,2 -k3,3 -k4,4V
+}
+INDEX="$(build_index)"
+[ -z "$INDEX" ] && { echo "No hosts found in $CONF_D" >&2; exit 1; }
+
+col() { cut -d$'\t' -f"$1"; }
+rows_for_env()     { grep -P "^[^\t]*\t\Q$1\E\t" <<<"$INDEX"; }
+rows_for_purpose() { grep -P "^[^\t]*\t\Q$1\E\t\Q$2\E\t" <<<"$INDEX"; }
+row_of()           { grep -P -m1 "^\Q$1\E\t" <<<"$INDEX"; }
+env_exists()       { col 2 <<<"$INDEX" | grep -qx "$1"; }
+search_rows() {    # best match first
+    awk -v q="$1" -f "$LIB/fleet-search.awk" <<<"$INDEX" |
+    sort -t$'\t' -k1,1nr -k2,2 | cut -f2-
+}
+
+# One display row for a host, returned in LABEL (no subshell: this runs for
+# every visible row on every keystroke while searching).
+#   host_label <index-row> server|alias
+host_label() {
+    local a s ip hn st first flag
+    IFS=$'\t' read -r a _ _ s ip hn st _ <<<"$1"
+    [ "$hn" = "-" ] && hn=""; [ "$st" = "-" ] && st=""
+    if [ "$2" = alias ]; then printf -v first '%-26s' "$a"
+    else printf -v first '%-11s' "$s"; first="${C3}${first}${N}"; fi
+    if [ -n "$st" ]; then flag="${C2}!${N}"; else flag=" "; fi
+    printf -v LABEL '%s %s %-16s %-19s' "$flag" "$first" "$ip" "${hn:--}"
+    [ "$2" = alias ] || LABEL="$LABEL ${DIM}${a}${N}"
+    [ -n "$st" ] && LABEL="$LABEL  ${C2}${st%% (*}${N}"
+    return 0
+}
+
+# --- recent hosts ------------------------------------------------------------
+record_use() { printf '%s\t%s\n' "$(date +%s)" "$1" >> "$HIST" 2>/dev/null; chmod 600 "$HIST" 2>/dev/null
+               tail -n 500 "$HIST" > "$HIST.t" 2>/dev/null && mv "$HIST.t" "$HIST" 2>/dev/null; }
+recent_list() { # most recent first, de-duplicated, only hosts that still exist
+    [ -f "$HIST" ] || return 0
+    tac "$HIST" 2>/dev/null | cut -f2 | awk '!seen[$0]++' |
+    while read -r a; do grep -qP "^\Q$a\E\t" <<<"$INDEX" && echo "$a"; done | head -10
+}
+
+# --- environment context -----------------------------------------------------
+get_env() { [ -f "$ENVFILE" ] && head -1 "$ENVFILE"; }
+set_env() { printf '%s\n' "$1" > "$ENVFILE"; chmod 600 "$ENVFILE" 2>/dev/null; }
+clear_env() { rm -f "$ENVFILE"; }
+
+# --- tree --------------------------------------------------------------------
+print_tree() {
+    local -a envs purposes rows
+    mapfile -t envs < <(col 2 <<<"$INDEX" | sort -u)
+    printf '%s%s%s\n' "$B" "fleet" "$N"
+    local ei pi ri env purpose ebranch epad pbranch ppad rbranch
+    for ei in "${!envs[@]}"; do
+        env="${envs[$ei]}"
+        if [ "$ei" -eq $(( ${#envs[@]} - 1 )) ]; then ebranch='└──'; epad='    '; else ebranch='├──'; epad='│   '; fi
+        printf '%s %s%s%s %s(%s hosts)%s\n' "$ebranch" "$C1$B" "$env" "$N" "$DIM" "$(rows_for_env "$env" | wc -l)" "$N"
+        mapfile -t purposes < <(rows_for_env "$env" | col 3 | sort -u)
+        for pi in "${!purposes[@]}"; do
+            purpose="${purposes[$pi]}"
+            if [ "$pi" -eq $(( ${#purposes[@]} - 1 )) ]; then pbranch='└──'; ppad='    '; else pbranch='├──'; ppad='│   '; fi
+            if [ "$purpose" = "-" ]; then printf '%s%s %s(direct)%s\n' "$epad" "$pbranch" "$DIM" "$N"
+            else printf '%s%s %s%s%s\n' "$epad" "$pbranch" "$C2" "$purpose" "$N"; fi
+            mapfile -t rows < <(rows_for_purpose "$env" "$purpose")
+            for ri in "${!rows[@]}"; do
+                if [ "$ri" -eq $(( ${#rows[@]} - 1 )) ]; then rbranch='└──'; else rbranch='├──'; fi
+                host_label "${rows[$ri]}" server
+                printf '%s%s%s%s\n' "$epad" "$ppad" "$rbranch" "$LABEL"
+            done
+        done
+    done
+}
+
+# =============================================================================
+#  MENU  -- arrow/vim keys, PgUp/PgDn, or type the number then Enter.
+#  Items live in M_LABEL[] / M_VALUE[]; an empty M_VALUE marks a heading the
+#  cursor skips. Lists taller than the terminal scroll in a viewport. Result is
+#  returned in REPLY.
+# =============================================================================
+declare -a M_LABEL M_VALUE M_MARK
+MULTI=0; M_CUR=0
+menu() {
+    local title="$1" hint="$2"
+    local n=${#M_LABEL[@]} cur=0 top=0 i num numbuf="" first=1 lines=0 k k2 rows maxvis end mark
+
+    while [ "$cur" -lt "$n" ] && [ -z "${M_VALUE[$cur]}" ]; do cur=$((cur+1)); done
+    [ "$cur" -ge "$n" ] && { REPLY=BACK; return; }
+
+    # No tty (piped, scripted, tests): plain numbered prompt.
+    if [ ! -t 0 ]; then
+        { printf '\n  %s%s%s\n\n' "$B" "$title" "$N"
+          num=0
+          for ((i=0;i<n;i++)); do
+              if [ -z "${M_VALUE[$i]}" ]; then printf '   %s\n' "${M_LABEL[$i]}"
+              else num=$((num+1)); printf '   %2d) %s\n' "$num" "${M_LABEL[$i]}"; fi
+          done
+          printf '\n   %s\n\n  > ' "$hint"; } >&2
+        read -r k || { REPLY=QUIT; return; }
+        case "$k" in
+            q|Q) REPLY=QUIT ;; b|B) REPLY=BACK ;; a|A) REPLY=ADD ;;
+            d|D) REPLY=DEL ;; e|E) REPLY=CHENV ;; t|T) REPLY=TMUX ;;
+            /*)  REPLY="SEARCH:${k#/}" ;;
+            ''|*[!0-9]*) REPLY=NOOP ;;
+            *) num=0
+               for ((i=0;i<n;i++)); do
+                   [ -z "${M_VALUE[$i]}" ] && continue
+                   num=$((num+1)); [ "$num" -eq "$k" ] && { REPLY="${M_VALUE[$i]}"; return; }
+               done
+               REPLY=NOOP ;;
+        esac
+        return
+    fi
+
+    printf '\033[?25l\033[?7l' >&2
+    while :; do
+        rows=$(term_rows)
+        maxvis=$(( rows - 8 )); [ "$maxvis" -lt 3 ] && maxvis=3
+        if [ "$n" -le "$maxvis" ]; then top=0
+        else
+            [ "$cur" -lt "$top" ] && top=$cur
+            [ "$cur" -ge $(( top + maxvis )) ] && top=$(( cur - maxvis + 1 ))
+        fi
+        end=$(( top + maxvis )); [ "$end" -gt "$n" ] && end=$n
+
+        [ "$first" -eq 0 ] && printf '\033[%dA' "$lines" >&2
+        first=0
+        printf '\r\033[K\n\033[K  %s%s%s\n\033[K\n' "$B" "$title" "$N" >&2
+        lines=3
+        # Numbers count selectable rows across the WHOLE list, so a typed number
+        # means the same host however far the viewport has scrolled.
+        num=0
+        for ((i=0;i<top;i++)); do [ -n "${M_VALUE[$i]}" ] && num=$((num+1)); done
+        for ((i=top;i<end;i++)); do
+            if [ -z "${M_VALUE[$i]}" ]; then
+                printf '\033[K   %s%s%s\n' "$DIM" "${M_LABEL[$i]}" "$N" >&2
+            else
+                num=$((num+1)); mark=""
+                if [ "$MULTI" -eq 1 ]; then
+                    if [ "${M_MARK[$i]:-0}" = 1 ]; then mark="${C3}[*]${N} "; else mark="${DIM}[ ]${N} "; fi
+                fi
+                if [ "$i" -eq "$cur" ]; then
+                    printf '\033[K  %s>%s %s%s%2d)%s%s\n' "$C1" "$N" "$mark" "$REV" "$num" "${M_LABEL[$i]}" "$N" >&2
+                else
+                    printf '\033[K    %s%2d)%s\n' "$mark" "$num" "${M_LABEL[$i]}" >&2
+                fi
+            fi
+            lines=$((lines+1))
+        done
+        if [ "$n" -gt "$maxvis" ]; then
+            printf '\033[K   %s… %d above · %d below%s\n' "$DIM" "$top" "$(( n - end ))" "$N" >&2
+            lines=$((lines+1))
+        fi
+        printf '\033[K\n\033[K   %s\n' "$hint" >&2
+        if [ "$MULTI" -eq 1 ]; then
+            printf '\033[K   %s↑↓ move · pgup/pgdn · space mark · * all · t tmux · enter connect%s%s\n' "$DIM" "${numbuf:+   [$numbuf]}" "$N" >&2
+        else
+            printf '\033[K   %s↑↓ move · pgup/pgdn · enter select · type a number%s%s\n' "$DIM" "${numbuf:+   [$numbuf]}" "$N" >&2
+        fi
+        lines=$((lines+3))
+        printf '\033[J' >&2
+
+        IFS= read -rsn1 k || { tty_restore; REPLY=QUIT; return; }
+        case "$k" in
+            $'\033')
+                k2=""; read -rsn2 -t 0.05 k2 2>/dev/null
+                case "$k2" in
+                    '[A') numbuf=""; while :; do cur=$(( (cur-1+n) % n )); [ -n "${M_VALUE[$cur]}" ] && break; done ;;
+                    '[B') numbuf=""; while :; do cur=$(( (cur+1) % n ));   [ -n "${M_VALUE[$cur]}" ] && break; done ;;
+                    '[5'|'[6')
+                        read -rsn1 -t 0.05 _ 2>/dev/null; numbuf=""
+                        if [ "$k2" = '[5' ]; then
+                            cur=$(( cur - maxvis )); [ "$cur" -lt 0 ] && cur=0
+                            while [ "$cur" -lt $((n-1)) ] && [ -z "${M_VALUE[$cur]}" ]; do cur=$((cur+1)); done
+                        else
+                            cur=$(( cur + maxvis )); [ "$cur" -ge "$n" ] && cur=$((n-1))
+                            while [ "$cur" -gt 0 ] && [ -z "${M_VALUE[$cur]}" ]; do cur=$((cur-1)); done
+                        fi ;;
+                    '')   tty_restore; REPLY=BACK; return ;;
+                esac ;;
+            k|K) numbuf=""; while :; do cur=$(( (cur-1+n) % n )); [ -n "${M_VALUE[$cur]}" ] && break; done ;;
+            j|J) numbuf=""; while :; do cur=$(( (cur+1) % n ));   [ -n "${M_VALUE[$cur]}" ] && break; done ;;
+            [0-9]) numbuf="$numbuf$k" ;;
+            $'\177'|$'\b') numbuf="${numbuf%?}" ;;
+            ' ') if [ "$MULTI" -eq 1 ]; then
+                     if [ "${M_MARK[$cur]:-0}" = 1 ]; then M_MARK[$cur]=0; else M_MARK[$cur]=1; fi
+                     while :; do cur=$(( (cur+1) % n )); [ -n "${M_VALUE[$cur]}" ] && break; done
+                 fi ;;
+            '*') if [ "$MULTI" -eq 1 ]; then
+                     local any=0 x
+                     for ((x=0;x<n;x++)); do [ -n "${M_VALUE[$x]}" ] && [ "${M_MARK[$x]:-0}" = 1 ] && any=1; done
+                     for ((x=0;x<n;x++)); do
+                         [ -z "${M_VALUE[$x]}" ] && continue
+                         if [ "$any" -eq 1 ]; then M_MARK[$x]=0; else M_MARK[$x]=1; fi
+                     done
+                 fi ;;
+            /)   tty_restore; M_CUR=$cur; REPLY=SEARCH; return ;;
+            t|T) tty_restore; M_CUR=$cur; REPLY=TMUX;  return ;;
+            q|Q) tty_restore; REPLY=QUIT;  return ;;
+            b|B) tty_restore; REPLY=BACK;  return ;;
+            a|A) tty_restore; REPLY=ADD;   return ;;
+            d|D) tty_restore; REPLY=DEL;   return ;;
+            e|E) tty_restore; REPLY=CHENV; return ;;
+            ''|$'\r')  # Enter (CR or LF): a typed number wins, else the highlighted row
+                 if [ -n "$numbuf" ]; then
+                     num=0
+                     for ((i=0;i<n;i++)); do
+                         [ -z "${M_VALUE[$i]}" ] && continue
+                         num=$((num+1))
+                         if [ "$num" -eq "$numbuf" ]; then tty_restore; M_CUR=$i; REPLY="${M_VALUE[$i]}"; return; fi
+                     done
+                     numbuf=""
+                 else
+                     tty_restore; M_CUR=$cur; REPLY="${M_VALUE[$cur]}"; return
+                 fi ;;
+        esac
+    done
+}
+
+# =============================================================================
+#  SEARCH  -- incremental: every keystroke re-filters the whole fleet.
+#  Several words must all match. Enter connects; Tab marks; Ctrl-T opens the
+#  marked hosts (or the highlighted one) in synchronised tmux panes.
+# =============================================================================
+search_ui() {
+    local q="${1:-}" cur=0 top=0 first=1 lines=0 k k2 i n rows maxvis end a box
+    local -a R=() pick=()
+    local -A SM=()
+
+    if [ ! -t 0 ]; then
+        mapfile -t R < <(search_rows "$q")
+        { printf '\n  %ssearch:%s %s  (%d)\n\n' "$B" "$N" "$q" "${#R[@]}"
+          for ((i=0; i<${#R[@]} && i<30; i++)); do
+              host_label "${R[$i]}" alias; printf '   %2d)%s\n' $((i+1)) "$LABEL"
+          done
+          printf '\n  > '; } >&2
+        read -r k || { REPLY=BACK; return; }
+        case "$k" in ''|*[!0-9]*) REPLY=BACK; return ;; esac
+        [ "$k" -ge 1 ] && [ "$k" -le "${#R[@]}" ] && connect "${R[$((k-1))]%%$'\t'*}"
+        REPLY=BACK; return
+    fi
+
+    printf '\033[?25l\033[?7l' >&2
+    while :; do
+        mapfile -t R < <(search_rows "$q")
+        n=${#R[@]}
+        [ "$cur" -ge "$n" ] && cur=$(( n > 0 ? n - 1 : 0 ))
+        rows=$(term_rows)
+        maxvis=$(( rows - 9 )); [ "$maxvis" -lt 3 ] && maxvis=3
+        [ "$cur" -lt "$top" ] && top=$cur
+        [ "$cur" -ge $(( top + maxvis )) ] && top=$(( cur - maxvis + 1 ))
+        if [ $(( top + maxvis )) -gt "$n" ]; then top=$(( n > maxvis ? n - maxvis : 0 )); fi
+        end=$(( top + maxvis )); [ "$end" -gt "$n" ] && end=$n
+
+        [ "$first" -eq 0 ] && printf '\033[%dA' "$lines" >&2
+        first=0
+        printf '\r\033[K\n\033[K  %ssearch ›%s %s%s█%s\n' "$B" "$N" "$q" "$C1" "$N" >&2
+        printf '\033[K  %s%d of %d hosts' "$DIM" "$n" "$(wc -l <<<"$INDEX")" >&2
+        [ "${#SM[@]}" -gt 0 ] && printf ' · %d marked' "${#SM[@]}" >&2
+        printf '%s\n\033[K\n' "$N" >&2
+        lines=4
+        for ((i=top;i<end;i++)); do
+            host_label "${R[$i]}" alias
+            a="${R[$i]%%$'\t'*}"
+            if [ -n "${SM[$a]:-}" ]; then box="${C3}[*]${N}"; else box="${DIM}[ ]${N}"; fi
+            if [ "$i" -eq "$cur" ]; then
+                printf '\033[K  %s>%s %s %s%s%s\n' "$C1" "$N" "$box" "$REV" "$LABEL" "$N" >&2
+            else
+                printf '\033[K    %s %s\n' "$box" "$LABEL" >&2
+            fi
+            lines=$((lines+1))
+        done
+        if [ "$n" -eq 0 ]; then printf '\033[K    %sno host matches%s\n' "$DIM" "$N" >&2; lines=$((lines+1)); fi
+        if [ "$n" -gt "$maxvis" ]; then
+            printf '\033[K   %s… %d above · %d below%s\n' "$DIM" "$top" "$(( n - end ))" "$N" >&2; lines=$((lines+1))
+        fi
+        printf '\033[K\n\033[K   %stype to filter · ↑↓ move · enter connect · tab mark · ctrl-t tmux · ctrl-u clear · esc back%s\n' "$DIM" "$N" >&2
+        lines=$((lines+2))
+        printf '\033[J' >&2
+
+        IFS= read -rsn1 k || { tty_restore; REPLY=QUIT; return; }
+        case "$k" in
+            $'\033')
+                k2=""; read -rsn2 -t 0.05 k2 2>/dev/null
+                case "$k2" in
+                    '[A') [ "$cur" -gt 0 ] && cur=$((cur-1)) ;;
+                    '[B') [ "$cur" -lt $((n-1)) ] && cur=$((cur+1)) ;;
+                    '[5') read -rsn1 -t 0.05 _ 2>/dev/null; cur=$(( cur - maxvis )); [ "$cur" -lt 0 ] && cur=0 ;;
+                    '[6') read -rsn1 -t 0.05 _ 2>/dev/null; cur=$(( cur + maxvis ))
+                          [ "$cur" -ge "$n" ] && cur=$(( n > 0 ? n - 1 : 0 )) ;;
+                    '')   tty_restore; REPLY=BACK; return ;;
+                esac ;;
+            $'\t')
+                if [ "$n" -gt 0 ]; then
+                    a="${R[$cur]%%$'\t'*}"
+                    if [ -n "${SM[$a]:-}" ]; then unset "SM[$a]"; else SM[$a]=1; fi
+                    [ "$cur" -lt $((n-1)) ] && cur=$((cur+1))
+                fi ;;
+            $'\x14')                                        # Ctrl-T
+                pick=()
+                if [ "${#SM[@]}" -gt 0 ]; then mapfile -t pick < <(printf '%s\n' "${!SM[@]}" | sort -V)
+                elif [ "$n" -gt 0 ]; then pick=("${R[$cur]%%$'\t'*}"); fi
+                tty_restore; launch_tmux_hosts "${pick[@]}"; REPLY=BACK; return ;;
+            $'\x15') q=""; cur=0; top=0 ;;                  # Ctrl-U
+            $'\177'|$'\b') q="${q%?}"; cur=0; top=0 ;;
+            ''|$'\r') if [ "$n" -gt 0 ]; then tty_restore; connect "${R[$cur]%%$'\t'*}"; fi ;;
+            *) if [[ "$k" == [[:print:]] ]]; then q="$q$k"; cur=0; top=0; fi ;;
+        esac
+    done
+}
+
+# --- actions -----------------------------------------------------------------
+MANAGE="$HERE/ssh-manage"
+TMUXER="$HERE/ssh-tmux"
+
+# Open hosts in synchronised tmux panes, then come back to the menu. If ssh-tmux
+# refuses (e.g. too many panes) keep its message on screen until acknowledged,
+# instead of the redraw wiping it before it can be read.
+launch_tmux_hosts() {
+    [ "$#" -eq 0 ] && return
+    [ -x "$TMUXER" ] || { echo "  ssh-tmux not found next to ssh-menu" >&2; return; }
+    local a; for a in "$@"; do record_use "$a"; done
+    # Run it on the menu's own terminal. Redirecting stdin from /dev/tty here
+    # made tmux refuse to attach ("open terminal failed: can't use /dev/tty").
+    "$TMUXER" "$@" || { printf '\n  %spress enter to continue%s ' "$DIM" "$N" >&2; read -r _ || true; }
+}
+launch_tmux() {
+    local -a sel=(); local i
+    for i in "${!M_VALUE[@]}"; do
+        [ -n "${M_VALUE[$i]}" ] && [ "${M_MARK[$i]:-0}" = 1 ] && sel+=("${M_VALUE[$i]}")
+    done
+    [ "${#sel[@]}" -eq 0 ] && [ -n "${M_VALUE[$M_CUR]:-}" ] && sel=("${M_VALUE[$M_CUR]}")
+    launch_tmux_hosts "${sel[@]}"
+}
+manage() {
+    [ -x "$MANAGE" ] || { echo "  ssh-manage not found next to ssh-menu" >&2; return; }
+    if { : </dev/tty; } 2>/dev/null; then "$MANAGE" "$@" </dev/tty; else "$MANAGE" "$@"; fi
+    printf '\n  %spress enter to continue%s ' "$DIM" "$N" >&2
+    if { : </dev/tty; } 2>/dev/null; then read -r _ </dev/tty; else read -r _ || true; fi
+    INDEX="$(build_index)"
+}
+connect() {
+    local a="$1" r ip hn
+    record_use "$a"
+    r=$(row_of "$a"); ip=$(cut -f5 <<<"$r"); hn=$(cut -f6 <<<"$r"); [ "$hn" = "-" ] && hn=""
+    printf '\n  %sconnecting:%s %s  %s(%s%s)%s\n\n' "$B" "$N" "$a" "$DIM" "$ip" "${hn:+ · $hn}" "$N" >&2
+    exec ssh "$a"
+}
+# search from inside a menu; exits the whole tool if search asked to quit
+run_search() { search_ui "$1"; [ "$REPLY" = QUIT ] && { echo; exit 0; }; return 0; }
+fuzzy() {
+    local sel
+    sel=$(awk -F'\t' '{printf "%-30s %-16s %-20s [%s/%s]\n", $1, $5, $6, $2, $3}' <<<"$INDEX" |
+          fzf --prompt='ssh > ' --height=80% --reverse --border) || return 1
+    printf '%s' "${sel%% *}"
+}
+
+# --- argument handling -------------------------------------------------------
+case "${1:-}" in
+    --tree|-t)   print_tree; exit 0 ;;
+    -s|--search) shift; search_ui "$*"; printf '\n' >&2; exit 0 ;;
+    /*)          q="$*"; search_ui "${q#/}"; printf '\n' >&2; exit 0 ;;
+    --env)       [ -n "${2:-}" ] || { echo "usage: ssh-menu --env <name>" >&2; exit 2; }
+                 env_exists "$2" || { echo "no such environment: $2" >&2; exit 1; }
+                 set_env "$2"; echo "environment context set to '$2'"; exit 0 ;;
+    --env-clear) clear_env; echo "environment context cleared"; exit 0 ;;
+    -f|--fuzzy)  if command -v fzf >/dev/null; then a=$(fuzzy) && [ -n "$a" ] && connect "$a"; exit 0
+                 else echo "fzf not installed (sudo apt install fzf); using menus" >&2; fi ;;
+    -h|--help)   sed -n '3,21p' "$0" | sed 's/^# \?//'; exit 0 ;;
+esac
+
+PRE_ENV="${1:-}"; PRE_PURPOSE="${2:-}"
+[ -n "$PRE_ENV" ] && { env_exists "$PRE_ENV" || { echo "no such environment: $PRE_ENV" >&2; exit 1; }; }
+
+choose_env() {
+    local -a envs; local e
+    mapfile -t envs < <(col 2 <<<"$INDEX" | sort -u)
+    M_LABEL=(); M_VALUE=(); M_MARK=(); MULTI=0
+    for e in "${envs[@]}"; do
+        M_LABEL+=("$(printf ' %-14s %s%s hosts%s' "$e" "$DIM" "$(rows_for_env "$e" | wc -l)" "$N")")
+        M_VALUE+=("$e")
+    done
+    menu "environment" "${C2}/${N}) search   ${C2}a${N}) add env   ${C2}d${N}) remove env   ${C2}q${N}) quit"
+}
+
+ENVCTX=""
+if [ -n "$PRE_ENV" ]; then ENVCTX="$PRE_ENV"
+else
+    ENVCTX="$(get_env)"
+    if [ -n "$ENVCTX" ] && ! env_exists "$ENVCTX"; then clear_env; ENVCTX=""; fi
+fi
+
+while :; do
+    if [ -z "$ENVCTX" ]; then
+        choose_env
+        case "$REPLY" in
+            QUIT) echo; exit 0 ;;
+            BACK|NOOP|CHENV) continue ;;
+            SEARCH|SEARCH:*) q="${REPLY#SEARCH}"; run_search "${q#:}"; continue ;;
+            ADD)   manage add-env; continue ;;
+            DEL)   manage rm-env;  continue ;;
+            *) ENVCTX="$REPLY"; [ -z "$PRE_ENV" ] && set_env "$ENVCTX" ;;
+        esac
+    fi
+
+    # --- purpose level (with the recent list on top) --------------------------
+    while :; do
+        if [ -n "$PRE_PURPOSE" ]; then purpose="$PRE_PURPOSE"; PRE_PURPOSE=''
+        else
+            M_LABEL=(); M_VALUE=(); M_MARK=(); MULTI=0
+            mapfile -t recents < <(recent_list)
+            if [ "${#recents[@]}" -gt 0 ]; then
+                M_LABEL+=("── recent ──"); M_VALUE+=("")
+                for a in "${recents[@]}"; do
+                    host_label "$(row_of "$a")" alias
+                    M_LABEL+=("$LABEL"); M_VALUE+=("GO:$a")
+                done
+                M_LABEL+=(""); M_VALUE+=("")
+                M_LABEL+=("── ${ENVCTX} purposes ──"); M_VALUE+=("")
+            fi
+            mapfile -t purposes < <(rows_for_env "$ENVCTX" | col 3 | sort -u)
+            for p in "${purposes[@]}"; do
+                M_LABEL+=("$(printf ' %-14s %s%s hosts%s' "$p" "$DIM" "$(rows_for_purpose "$ENVCTX" "$p" | wc -l)" "$N")")
+                M_VALUE+=("P:$p")
+            done
+            menu "${ENVCTX} › purpose" \
+                 "${C2}/${N}) search   ${C2}e${N}) change env   ${C2}a${N}) add server   ${C2}q${N}) quit"
+            case "$REPLY" in
+                QUIT) echo; exit 0 ;;
+                NOOP|TMUX) continue ;;
+                BACK) [ -n "$PRE_ENV" ] && { echo; exit 0; }; ENVCTX=""; clear_env; break ;;
+                CHENV) ENVCTX=""; clear_env; break ;;
+                SEARCH|SEARCH:*) q="${REPLY#SEARCH}"; run_search "${q#:}"; continue ;;
+                ADD)  manage add-host "$ENVCTX"; continue ;;
+                DEL)  manage rm-host; continue ;;
+                GO:*) connect "${REPLY#GO:}" ;;
+                P:*)  purpose="${REPLY#P:}" ;;
+                *) continue ;;
+            esac
+        fi
+
+        # --- server level -----------------------------------------------------
+        while :; do
+            M_LABEL=(); M_VALUE=(); M_MARK=(); MULTI=1
+            mapfile -t rows < <(rows_for_purpose "$ENVCTX" "$purpose")
+            for r in "${rows[@]}"; do
+                host_label "$r" server
+                M_LABEL+=("$LABEL"); M_VALUE+=("${r%%$'\t'*}")
+            done
+            menu "${ENVCTX} › ${purpose} › server" \
+                 "${C2}/${N}) search   ${C2}space${N}) mark   ${C2}t${N}) tmux   ${C2}a${N}) add   ${C2}d${N}) remove   ${C2}b${N}) back"
+            case "$REPLY" in
+                QUIT) echo; exit 0 ;;
+                BACK|NOOP) break ;;
+                CHENV) ENVCTX=""; clear_env; break 2 ;;
+                SEARCH|SEARCH:*) q="${REPLY#SEARCH}"; run_search "${q#:}"; continue ;;
+                ADD)  manage add-host "$ENVCTX" "$purpose"; continue ;;
+                DEL)  manage rm-host; continue ;;
+                TMUX) launch_tmux; continue ;;
+                *) connect "$REPLY" ;;
+            esac
+        done
+        [ -n "$PRE_ENV" ] && [ -n "${2:-}" ] && { echo; exit 0; }
+    done
+done

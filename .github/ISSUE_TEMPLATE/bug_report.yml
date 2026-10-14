@@ -1,0 +1,45 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste real infrastructure data.** Replace addresses with the
+        RFC 5737 ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) and
+        host, domain and account names with invented ones before submitting.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what you got instead.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Minimal config that reproduces it
+      description: The smallest redacted Host blocks needed, ideally based on examples/config.d.
+      render: ssh-config
+  - type: input
+    id: openssh
+    attributes:
+      label: OpenSSH version
+      description: Output of `ssh -V`
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS, shell and tmux version
+      placeholder: Ubuntu 24.04, bash 5.2, tmux 3.4
+    validations:
+      required: true
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Privacy
+      options:
+        - label: I have removed real IP addresses, host names, domains, user names and any secrets.
+          required: true

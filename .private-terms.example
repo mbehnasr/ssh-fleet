@@ -1,0 +1,9 @@
+# Copy to .private-terms (gitignored) and list anything that must never be
+# published: one term per line, matched case-insensitively anywhere in the
+# tracked files by tests/check-no-private-data.sh. Comments start with #.
+#
+# Good candidates: internal domains, hostname prefixes, environment and
+# cluster names, registry hosts, account and colleague user names.
+example-corp.internal
+exmpl-k8s-
+your-login-name

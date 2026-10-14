@@ -1,0 +1,4 @@
+#!/bin/sh
+# SSH_ASKPASS backend: hands the prompt to ssh-pass, which answers from the
+# login keyring or asks you once and offers to remember it.
+exec "$(dirname "$(readlink -f "$0")")/ssh-pass" askpass "$@"
